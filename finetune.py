@@ -3,10 +3,14 @@ import argparse
 import sys
 from collections import defaultdict, deque
 import pickle
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings('ignore')
 
 import numpy as np
 from PIL import Image
 import cv2
+import pickle
 
 from sahi.utils.coco import Coco
 from sahi.utils.cv import get_bool_mask_from_coco_segmentation
@@ -26,7 +30,7 @@ import segmentation_models_pytorch as smp
 from transformers.models.maskformer.modeling_maskformer import dice_loss, sigmoid_focal_loss
 
 # Add the SAM directory to the system path
-sys.path.append("./segment-anything")
+#sys.path.append("./segment-anything")
 from segment_anything import sam_model_registry
 
 NUM_WORKERS = 0  # https://github.com/pytorch/pytorch/issues/42518
@@ -128,6 +132,89 @@ class Coco2MaskDataset(Dataset):
             bboxes.append(bbox)
             masks.append(mask)
             labels.append(label)
+        bboxes = np.stack(bboxes, axis=0)
+        masks = np.stack(masks, axis=0)
+        labels = np.stack(labels, axis=0)
+        return image, torch.tensor(bboxes), torch.tensor(masks).long()
+    
+    @classmethod
+    def collate_fn(cls, batch):
+        images, bboxes, masks = zip(*batch)
+        images = torch.stack(images, dim=0)
+        return images, bboxes, masks
+
+class TNMaskDataset(Dataset):
+    def __init__(self, data_root, split, image_size):
+        self.data_root = data_root
+        self.split = split
+        self.image_size = image_size
+
+        files_record = open(os.path.join(data_root,split+'.txt'),'r')
+        self.file_list = []
+        
+        line = files_record.readline()
+        while line:
+            self.file_list.append(line.strip())
+            line = files_record.readline()
+        
+        # TODO: use ResizeLongestSide and pad to square
+        self.to_tensor = transforms.ToTensor()
+        self.normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        self.image_resize = transforms.Resize((image_size, image_size), interpolation=Image.BILINEAR)
+        
+        self.caches_on = False
+        self.caches = []
+        self.do_caches()
+    def do_caches(self):
+        if self.caches_on:
+            pass
+        else:
+            cache_file_dir = os.path.join(self.data_root,self.split+'.caches')
+            if os.path.exists(cache_file_dir):
+                fptr = open(self.cache_file_dir, "rb")
+                self.caches = pickle.load(fptr)
+                fptr.close()                 
+            else:
+                for index in tqdm(range(len(self.file_list))):
+                    self.caches.append(self.__getitem__(index))
+                fptr = open(cache_file_dir, "wb")  # open file in write binary mode
+                pickle.dump(self.caches, fptr)  # dump list data into file 
+                fptr.close()            
+        self.caches_on = True
+    def __len__(self):
+        return len(self.file_list)
+
+    def __getitem__(self, index):
+        
+        if self.caches_on:
+            return self.caches[index]
+        
+        image_name = self.file_list[index]
+        image = Image.open(os.path.join(self.data_root, "image", image_name+".bmp")).convert("RGB")
+        #original_width, original_height = image.width, image.height
+        #ratio_h = self.image_size / image.height
+        #ratio_w = self.image_size / image.width
+        image = self.image_resize(image)
+        image = self.to_tensor(image)
+        image = self.normalize(image)
+
+        bboxes = []
+        masks = []
+        labels = []
+        
+        mask = np.array(Image.open(os.path.join(self.data_root, "mask", image_name+".bmp")))
+        mask = cv2.resize(mask, (self.image_size, self.image_size), interpolation=cv2.INTER_LINEAR)
+        mask = (mask > 0.5).astype(np.uint8)
+        contours, hierarchy = cv2.findContours(mask, cv2.RETR_LIST,
+                                                cv2.CHAIN_APPROX_SIMPLE)[-2:]
+
+        x, y, w, h = cv2.boundingRect(contours[0]) #第一个为最大连通域，为目标区域
+        bbox = [x, y, x + w, y + h]
+        label=1
+        
+        bboxes.append(bbox)
+        masks.append(mask)
+        labels.append(label)
         bboxes = np.stack(bboxes, axis=0)
         masks = np.stack(masks, axis=0)
         labels = np.stack(labels, axis=0)
@@ -351,8 +438,10 @@ def main():
     args = parser.parse_args()
 
     # load the dataset
-    train_dataset = Coco2MaskDataset(data_root=args.data_root, split="train", image_size=args.image_size)
-    val_dataset = Coco2MaskDataset(data_root=args.data_root, split="val", image_size=args.image_size)
+    #train_dataset = Coco2MaskDataset(data_root=args.data_root, split="train", image_size=args.image_size)
+    #val_dataset = Coco2MaskDataset(data_root=args.data_root, split="val", image_size=args.image_size)
+    train_dataset = TNMaskDataset(data_root=args.data_root, split="train", image_size=args.image_size)
+    val_dataset = TNMaskDataset(data_root=args.data_root, split="val", image_size=args.image_size)
 
     # create the model
     model = SAMFinetuner(
