@@ -164,7 +164,7 @@ class TNMaskDataset(Dataset):
         
         self.caches_on = False
         self.caches = []
-        self.do_caches()
+        #self.do_caches()
     def do_caches(self):
         if self.caches_on:
             pass
